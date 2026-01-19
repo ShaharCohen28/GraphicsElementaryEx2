@@ -12,7 +12,25 @@ def harris_corner_detector(im):
     :param im: A 2D array representing a grayscale image.
     :return: An array with shape (N,2), where its ith entry is the [x,y] coordinates of the ith corner point.
     """
-    pass
+    kx = np.array([[1, 0, -1]])
+    ky = kx.T
+    
+    Ix = convolve2d(im, kx, mode='same', boundary='symm')
+    Iy = convolve2d(im, ky, mode='same', boundary='symm')
+    
+    Ix2 = blur_spatial(Ix**2, kernel_size=3)
+    Iy2 = blur_spatial(Iy**2, kernel_size=3)
+    IxIy = blur_spatial(Ix * Iy, kernel_size=3)
+    
+    det_M = (Ix2 * Iy2) - (IxIy**2)
+    trace_M = Ix2 + Iy2
+    a = 0.04
+    R = det_M - a * (trace_M**2)
+    
+    binary_local_max = non_maximum_suppression(R)
+    
+    y, x = np.where(binary_local_max)
+    return np.column_stack((x, y))
 
 def feature_descriptor(im, points, desc_rad=3):
     """
@@ -22,7 +40,36 @@ def feature_descriptor(im, points, desc_rad=3):
     :param desc_rad: "Radius" of descriptors to compute.
     :return: An array of 2D patches, each patch i representing the descriptor of point i.
     """
-    pass
+    patch_size = 2 * desc_rad + 1
+    
+    x_range = np.arange(-desc_rad, desc_rad + 1)
+    y_range = np.arange(-desc_rad, desc_rad + 1)
+    xv, yv = np.meshgrid(x_range, y_range) # xv is columns, yv is rows
+    
+    xv_flat = xv.flatten()
+    yv_flat = yv.flatten()
+    
+    descriptors = []
+    
+    for x_c, y_c in points:
+        sample_y = y_c + yv_flat
+        sample_x = x_c + xv_flat
+        
+        patch = map_coordinates(im, [sample_y, sample_x], order=1, prefilter=False)
+        patch = patch.reshape((patch_size, patch_size))
+        
+        mean_val = np.mean(patch)
+        patch_centered = patch - mean_val
+        norm_val = np.linalg.norm(patch_centered)
+        
+        if norm_val == 0:
+            norm_patch = patch_centered
+        else:
+            norm_patch = patch_centered / norm_val
+            
+        descriptors.append(norm_patch)
+        
+    return np.array(descriptors)
 
 def find_features(im):
     """
@@ -33,7 +80,15 @@ def find_features(im):
                 These coordinates are provided at the original image level.
             2) A feature descriptor array with shape (N,K,K)
     """
-    pass
+    pyr = build_gaussian_pyramid(im, max_levels=3, filter_size=3)
+
+    points_level1 = spread_out_corners(im, m=7, n=7, radius=12, harris_corner_detector=harris_corner_detector)
+    
+    points_level3 = points_level1 / 4.0
+    
+    descriptors = feature_descriptor(pyr[2], points_level3, desc_rad=3)
+    
+    return [points_level1, descriptors]
 
 def match_features(desc1, desc2, min_score):
     """
@@ -45,7 +100,36 @@ def match_features(desc1, desc2, min_score):
                 1) An array with shape (M,) and dtype int of matching indices in desc1.
                 2) An array with shape (M,) and dtype int of matching indices in desc2.
     """
-    pass
+    N1 = desc1.shape[0]
+    N2 = desc2.shape[0]
+    D1 = desc1.reshape(N1, -1)
+    D2 = desc2.reshape(N2, -1)
+    
+    scores = np.dot(D1, D2.T) 
+    
+    row_top2_indices = np.argpartition(scores, -2, axis=1)[:, -2:]
+    
+    col_top2_indices = np.argpartition(scores, -2, axis=0)[-2:, :]
+    
+    matches_1 = []
+    matches_2 = []
+    
+    for i in range(N1):
+        for j in range(N2):
+            score = scores[i, j]
+            
+            if score < min_score:
+                continue
+                
+            is_row_top = j in row_top2_indices[i]
+            
+            is_col_top = i in col_top2_indices[:, j]
+            
+            if is_row_top and is_col_top:
+                matches_1.append(i)
+                matches_2.append(j)
+                
+    return [np.array(matches_1, dtype=int), np.array(matches_2, dtype=int)]
 
 def apply_homography(pos1, H12):
     """
@@ -54,7 +138,18 @@ def apply_homography(pos1, H12):
     :param H12: A 3x3 homography matrix.
     :return: An array with the same shape as pos1 with [x,y] point coordinates obtained from transforming pos1 using H12.
     """
-    pass
+    N = pos1.shape[0]
+    ones = np.ones((N, 1))
+    xyz = np.hstack([pos1, ones])
+    
+    transformed_xyz = (H12 @ xyz.T).T
+    
+    Z = transformed_xyz[:, 2:3]
+
+    epsilon = 1e-10 # avoid division by zero
+    xy_new = transformed_xyz[:, :2] / (Z + epsilon)
+    
+    return xy_new
 
 def ransac_homography(points1, points2, num_iter, inlier_tol, translation_only=False):
     """
@@ -69,7 +164,37 @@ def ransac_homography(points1, points2, num_iter, inlier_tol, translation_only=F
                 2) An Array with shape (S,) where S is the number of inliers,
                     containing the indices in pos1/pos2 of the maximal set of inlier matches found.
     """
-    pass
+    N = points1.shape[0]
+    best_inliers = []
+    best_H = np.eye(3)
+    
+    if N < 2:
+        return [best_H, np.array([], dtype=int)]
+
+    for _ in range(num_iter):
+        sample_indices = np.random.choice(N, size=2, replace=False)
+        p1_sample = points1[sample_indices]
+        p2_sample = points2[sample_indices]
+        
+        H_curr = estimate_rigid_transform(p1_sample, p2_sample, translation_only)
+        
+        p1_transformed = apply_homography(points1, H_curr)
+        
+        diff = p1_transformed - points2
+        dist_sq = np.sum(diff**2, axis=1) 
+        
+        current_inliers_indices = np.where(dist_sq < inlier_tol)[0]
+        
+        if len(current_inliers_indices) > len(best_inliers):
+            best_inliers = current_inliers_indices
+            best_H = H_curr 
+            
+    if len(best_inliers) > 0:
+        p1_inliers = points1[best_inliers]
+        p2_inliers = points2[best_inliers]
+        best_H = estimate_rigid_transform(p1_inliers, p2_inliers, translation_only)
+        
+    return [best_H, np.array(best_inliers, dtype=int)]
 
 def display_matches(im1, im2, points1, points2, inliers):
     """
@@ -80,7 +205,41 @@ def display_matches(im1, im2, points1, points2, inliers):
     :param points2: An aray shape (N,2), containing N rows of [x,y] coordinates of matched points in im2.
     :param inliers: An array with shape (S,) of inlier matches.
     """
-    pass
+    h1, w1 = im1.shape
+    h2, w2 = im2.shape
+    
+    canvas = np.zeros((max(h1, h2), w1 + w2))
+    canvas[:h1, :w1] = im1
+    canvas[:h2, w1:w1+w2] = im2
+    
+    plt.figure(figsize=(10, 5))
+    plt.imshow(canvas, cmap='gray')
+    
+    points2_shifted = points2.copy()
+    points2_shifted[:, 0] += w1
+    
+    plt.scatter(points1[:, 0], points1[:, 1], c='r', s=3)
+    plt.scatter(points2_shifted[:, 0], points2_shifted[:, 1], c='r', s=3)
+    
+    N = points1.shape[0]
+    inlier_set = set(inliers)
+    
+    for i in range(N):
+        p1 = points1[i]
+        p2 = points2_shifted[i]
+        
+        if i in inlier_set:
+            color = 'b' 
+            alpha = 0.8
+            width = 0.5
+        else:
+            color = 'y' 
+            alpha = 0.3
+            width = 0.5
+            
+        plt.plot([p1[0], p2[0]], [p1[1], p2[1]], c=color, alpha=alpha, linewidth=width)
+        
+    plt.show()
 
 
 def accumulate_homographies(H_successive, m):
@@ -94,7 +253,36 @@ def accumulate_homographies(H_successive, m):
     :return: A list of M 3x3 homography matrices,
       where H2m[i] transforms points from coordinate system i to coordinate system m
     """
-    pass
+
+    
+    M = len(H_successive) + 1 
+    H_accumulated = [None] * M
+    
+    # Case i = m
+    H_accumulated[m] = np.eye(3)
+    
+    # Case i < m:
+    curr_H = np.eye(3)
+    for i in range(m - 1, -1, -1):
+
+        H_i_iplus1 = H_successive[i]
+        curr_H = curr_H @ H_i_iplus1
+        
+        curr_H = curr_H / curr_H[2, 2]
+        H_accumulated[i] = curr_H
+    
+    # Case i > m:
+    curr_H = np.eye(3)
+    for i in range(m + 1, M):
+        H_iminus1_i = H_successive[i-1]
+        H_i_iminus1 = np.linalg.inv(H_iminus1_i)
+        
+        curr_H = curr_H @ H_i_iminus1
+        
+        curr_H = curr_H / curr_H[2, 2]
+        H_accumulated[i] = curr_H
+        
+    return H_accumulated
 
 
 def compute_bounding_box(homography, w, h):
@@ -106,7 +294,22 @@ def compute_bounding_box(homography, w, h):
     :return: 2x2 array, where the first row is [x,y] of the top left corner,
      and the second row is the [x,y] of the bottom right corner
     """
-    pass
+    # Corners of the image: (0,0), (w,0), (0,h), (w,h)
+    corners = np.array([
+        [0, 0],
+        [w, 0],
+        [0, h],
+        [w, h]
+    ])
+    
+    warped_corners = apply_homography(corners, homography)
+    
+    x_min = np.min(warped_corners[:, 0])
+    x_max = np.max(warped_corners[:, 0])
+    y_min = np.min(warped_corners[:, 1])
+    y_max = np.max(warped_corners[:, 1])
+    
+    return np.array([[x_min, y_min], [x_max, y_max]]).astype(int)
 
 def warp_channel(image, homography):
     """
@@ -115,7 +318,35 @@ def warp_channel(image, homography):
     :param homography: homograhpy.
     :return: A 2d warped image.
     """
-    pass
+    h, w = image.shape
+    
+
+    bbox = compute_bounding_box(homography, w, h)
+    x_min, y_min = bbox[0]
+    x_max, y_max = bbox[1]
+    
+
+    dest_w = x_max - x_min
+    dest_h = y_max - y_min
+    
+    x_range = np.arange(x_min, x_max)
+    y_range = np.arange(y_min, y_max)
+    
+    xv, yv = np.meshgrid(x_range, y_range)
+    
+    xv_flat = xv.flatten()
+    yv_flat = yv.flatten()
+    dest_points = np.column_stack((xv_flat, yv_flat))
+    
+    H_inv = np.linalg.inv(homography)
+    src_points = apply_homography(dest_points, H_inv)
+    
+    src_x = src_points[:, 0].reshape(dest_h, dest_w)
+    src_y = src_points[:, 1].reshape(dest_h, dest_w)
+    
+    warped_im = map_coordinates(image, [src_y, src_x], order=1, prefilter=False)
+    
+    return warped_im
 
 def warp_image(image, homography):
     """
@@ -124,7 +355,14 @@ def warp_image(image, homography):
     :param homography: homograhpy.
     :return: A warped image.
     """
-    pass
+    if image.ndim == 2:
+        return warp_channel(image, homography)
+    
+    layers = []
+    for i in range(3):
+        layers.append(warp_channel(image[:, :, i], homography))
+        
+    return np.dstack(layers)
 
 
 
